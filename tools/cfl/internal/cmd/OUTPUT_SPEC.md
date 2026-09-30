@@ -245,7 +245,25 @@ ID: <id>
 URL: <url>
 ```
 
+With `--body-format adf` or `xhtml` the page is read back after the write and
+compared with what was sent. See the `page edit` section for the stderr blocks
+emitted on normalization and on content loss.
+
+A create has no state to compare against, so the formatting-loss and
+comparison-unavailable blocks described there are never emitted here.
+
 ## `page edit <page-id>`
+
+Refused, when the page holds content the requested body format cannot carry
+(exit non-zero, nothing written):
+
+```text
+refusing to write this page as <format>: the <format> representation cannot carry content it currently has, and writing would remove it
+  - <construct> (<count>) — <consequence>
+
+Use --body-format xhtml to edit this page without losing them.
+Pass --allow-lossy to write it as <format> anyway.
+```
 
 Success:
 
@@ -255,6 +273,90 @@ ID: <id>
 Version: <version>
 URL: <url>
 ```
+
+With `--body-format adf` or `xhtml` the page is read back and compared with
+what was sent. When the stored body differs, a warning is written to stderr
+after the success block. Attribute normalization is reported and the command
+still succeeds:
+
+```text
+Confluence normalized the stored <format> body. Content is intact; these attributes were dropped:
+  - <node>.attrs.<name> (<before>→<after>)
+```
+
+Formatting the stored page no longer carries is reported before the other
+blocks, and the command still succeeds — the write landed, only formatting
+was collateral:
+
+```text
+The stored page lost formatting that was present before this write:
+  - <element> (<before>→<after>)
+<cause> Compare against the storage body before assuming the change was clean.
+```
+
+`<cause>` names why loss is possible for the format in use: an ADF round trip
+does not always preserve marks the storage body carries, whereas a storage
+write carries only what the caller submitted.
+
+When the comparison could not be made at all, that is stated rather than
+passed over in silence, because silence is what a clean write looks like:
+
+```text
+Could not compare the stored page against its state before the write, so formatting loss would not have been noticed. (<reason>)
+```
+
+Attributes the server added rather than dropped are reported the same way:
+
+```text
+Confluence added attributes that were not sent:
+  + <node>.attrs.<name> (<before>→<after>)
+```
+
+A storage-format write also compares each macro's parameters. Their order
+within a macro is the server's to choose and is not reported; a parameter that
+was added, dropped or edited is, and the command exits non-zero. `<n>` counts
+the macros opening before the parameter, so a value moving between two macros
+reads as a change rather than a reordering:
+
+```text
+Stored <format> body does not hold the macro parameters that were sent. Page text is intact; these parameters differ:
+  - macro <n> parameter <name>=<value> (<before>→<after>)
+  + macro <n> parameter <name>=<value> (<before>→<after>)
+```
+
+Content loss is reported the same way and the command exits non-zero. The
+first line names what moved in the document — one of three shapes:
+
+```text
+Stored <format> body does not match what was sent: visible text went from <n> to <n> characters.
+Stored <format> body does not match what was sent: visible text is unchanged at <n> characters, but embedded content differs.
+Stored <format> body does not match what was sent: content differs at the same length of <n> characters.
+```
+
+followed by:
+
+```text
+The page was updated, but it does not hold the content supplied. Re-read the page before treating the change as applied.
+  first difference at offset <n> — sent "<excerpt>", stored "<excerpt>"
+  embedded content changed:
+    ~ <nodeType> (<before>→<after>)
+  attributes dropped:
+    - <node>.attrs.<name> (<before>→<after>)
+  attributes added:
+    + <node>.attrs.<name> (<before>→<after>)
+  macro parameters dropped:
+    - macro <n> parameter <name>=<value> (<before>→<after>)
+  macro parameters added:
+    + macro <n> parameter <name>=<value> (<before>→<after>)
+```
+
+The offset line is omitted when the visible text is identical and only
+embedded content changed. The embedded-content lines identify what moved in
+that case, including for node types such as `hardBreak` and `rule` that carry
+no attributes of their own.
+
+Counts are characters a reader sees and the offset is a character position,
+both measured on the document rather than on any internal representation.
 
 ## `page copy <page-id>`
 

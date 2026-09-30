@@ -28,6 +28,8 @@ type editOptions struct {
 	parent             string
 	message            string
 	messageExplicit    bool
+	noVerify           bool
+	allowLossy         bool
 }
 
 func newEditCmd(rootOpts *root.Options) *cobra.Command {
@@ -48,7 +50,22 @@ Content can be provided via:
 
 Content format is selected with --body-format markdown|adf|xhtml.
 Omitting --body-format means Markdown. ADF and XHTML are validated or sent
-without conversion.`,
+without conversion.
+
+ADF IS LOSSY. Confluence's ADF representation does not carry everything its
+storage representation does: emphasis wrapping an inline code span is
+dropped, and internal links become plain expanded URLs. Reading a page as
+ADF and writing it back therefore destroys content the caller never touched,
+and the caller cannot see it because their copy is already missing it. A
+write that would remove such content is refused; use --body-format xhtml to
+edit those pages, or --allow-lossy to proceed anyway.
+
+For --body-format adf or xhtml the page is read back after writing and the
+stored body compared against what was sent, because Confluence can store
+something other than what it was given. Losing text is an error; attributes
+the server normalizes away are reported and tolerated. Markdown is converted
+before sending, so there is nothing to compare it against and the check is
+skipped. Use --no-verify to skip the read.`,
 		Example: `  # Edit a page in the editor with current content
   cfl page edit 12345 --editor
 
@@ -110,6 +127,8 @@ without conversion.`,
 	cmd.Flags().BoolVar(&opts.editor, "editor", false, "Open editor for content")
 	cmd.Flags().StringVar(&opts.bodyFormat, "body-format", bodyFormatMarkdown, "Input format: markdown, adf, or xhtml")
 	cmd.Flags().BoolVar(&opts.legacy, "legacy", false, "Edit page in legacy editor format (Markdown input only)")
+	cmd.Flags().BoolVar(&opts.noVerify, "no-verify", false, "Skip reading the page back to confirm what Confluence stored (adf/xhtml input)")
+	cmd.Flags().BoolVar(&opts.allowLossy, "allow-lossy", false, "Write in a body format that cannot carry content the page currently has")
 
 	return cmd
 }
@@ -139,6 +158,7 @@ func runEdit(ctx context.Context, opts *editOptions) error {
 	hasStdinData := (opts.Stdin != nil && opts.Stdin != os.Stdin) || hasPipedOSStdin(opts.Options)
 	hasNewContent := opts.file != "" || opts.editor || hasStdinData
 	var newBody *api.Body
+	var sentContent string
 	if hasNewContent && !opts.editor {
 		content, err := getEditContent(opts, nil, bodyFormat)
 		if err != nil {
@@ -147,6 +167,7 @@ func runEdit(ctx context.Context, opts *editOptions) error {
 		if strings.TrimSpace(content) == "" {
 			return fmt.Errorf("page content cannot be empty")
 		}
+		sentContent = content
 		newBody, err = bodyForInput(content, bodyFormat, opts.legacy)
 		if err != nil {
 			return err
@@ -173,6 +194,51 @@ func runEdit(ctx context.Context, opts *editOptions) error {
 		return err
 	}
 
+	// The page's current storage body, derived once and before the editor
+	// opens. It is the lossy-format guard's evidence and the verification
+	// baseline both, and refusing after an editor session would discard work
+	// the operator had just done.
+	// A title- or parent-only edit resends the body it just read.
+	resendsExistingBody := !hasNewContent && !opts.editor && (opts.title != "" || opts.parent != "")
+	writesBody := hasNewContent || opts.editor || resendsExistingBody
+	// What gets sent decides, not what was asked for. A resend hands the
+	// page's own body back unchanged, so --body-format is irrelevant to it:
+	// verified against a page carrying both an ac:link and emphasis around a
+	// code span, where a title-only edit with --body-format adf left every
+	// one of them intact. Only a caller-supplied ADF payload can drop what
+	// the page currently has.
+	writesADF := bodyFormat == bodyFormatADF && !resendsExistingBody
+
+	currentStorage := func() (string, string) {
+		if body := bodyValue(existingPage, bodyFormatXHTML); body != "" {
+			return body, ""
+		}
+		return fetchStorageBody(ctx, client, opts.pageID)
+	}
+
+	// Read it only when a consumer wants it: verification needs it for an
+	// exact body format, and the guard needs it for an ADF payload.
+	var storageBefore, storageBeforeErr string
+	if writesBody && (verificationApplies(bodyFormat, hasNewContent, opts.noVerify) || writesADF) {
+		storageBefore, storageBeforeErr = currentStorage()
+	}
+
+	// Refuse before writing, and before the editor: once the ADF is written
+	// the content is gone, and the caller's own copy never had it to restore
+	// from.
+	// --no-verify silences the readback, not this: the baseline gate above
+	// includes writesADF for that reason, so the guard always has its
+	// evidence here.
+	if writesBody && writesADF && !opts.allowLossy {
+		current, currentErr := storageBefore, storageBeforeErr
+		if current == "" {
+			return fmt.Errorf("cannot confirm this page is safe to write as %s: its current content could not be read (%s)\nUse --body-format xhtml, or --allow-lossy to write anyway", bodyFormat, orUnknown(currentErr))
+		}
+		if findings := findLossyConstructs(current); len(findings) > 0 {
+			return lossyFormatError(findings, bodyFormat)
+		}
+	}
+
 	newTitle := opts.title
 	if newTitle == "" {
 		newTitle = existingPage.Title
@@ -188,6 +254,7 @@ func runEdit(ctx context.Context, opts *editOptions) error {
 			return fmt.Errorf("page content cannot be empty")
 		}
 
+		sentContent = content
 		newBody, err = bodyForInput(content, bodyFormat, opts.legacy)
 		if err != nil {
 			return err
@@ -227,7 +294,21 @@ func runEdit(ctx context.Context, opts *editOptions) error {
 		}
 	}
 
-	return cflpresent.Emit(opts.Options, cflpresent.PagePresenter{}.PresentEdit(page, cfg.URL, opts.legacy && hasNewContent))
+	if err := cflpresent.Emit(opts.Options, cflpresent.PagePresenter{}.PresentEdit(page, cfg.URL, opts.legacy && hasNewContent)); err != nil {
+		return err
+	}
+
+	return verifyStoredBody(ctx, verifyRequest{
+		opts:              opts.Options,
+		client:            client,
+		pageID:            opts.pageID,
+		bodyFormat:        bodyFormat,
+		sentContent:       sentContent,
+		storageBefore:     storageBefore,
+		storageBeforeErr:  storageBeforeErr,
+		comparePriorState: true,
+		enabled:           verificationApplies(bodyFormat, hasNewContent, opts.noVerify),
+	})
 }
 
 func getEditContent(opts *editOptions, existingPage *api.Page, bodyFormat string) (string, error) {
